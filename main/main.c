@@ -2,7 +2,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/param.h>
-#include <unistd.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -16,6 +15,7 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "lwip/sockets.h"
 #include "nvs_flash.h"
 
 static const char *TAG = "badge";
@@ -66,17 +66,19 @@ static void cmd(int cog, uint8_t index, const uint8_t *data, size_t n)
     cmd(cog, index, (const uint8_t[]){__VA_ARGS__}, sizeof((const uint8_t[]){__VA_ARGS__}))
 
 // Each CoG pulls its BUSY low while it works. Logs how long each side stayed busy (-1: timeout).
-static void wait_ready(const char *what)
+// Returns false on timeout.
+static bool wait_ready(const char *what, int timeout_ms)
 {
     int64_t t0 = esp_timer_get_time(), t = 0;
     int l = -1, r = -1;
-    while ((l < 0 || r < 0) && t < 120000000) {
+    while ((l < 0 || r < 0) && t < timeout_ms * 1000LL) {
         t = esp_timer_get_time() - t0;
         if (l < 0 && gpio_get_level(BUSY_L)) l = t / 1000;
         if (r < 0 && gpio_get_level(BUSY_R)) r = t / 1000;
         if (l < 0 || r < 0) ms(10);
     }
     ESP_LOGI(TAG, "%s: BUSY left %d ms, right %d ms", what, l, r);
+    return l >= 0 && r >= 0;
 }
 
 static uint8_t rev(uint8_t b)
@@ -100,8 +102,73 @@ static void send_half(int cog, uint8_t index, const uint8_t *plane)
     cmd(cog, index, buf, HALF);
 }
 
-// The update steps, same sequence as PDi EPD_Driver_GU_large and the stock epd.py:
-// reset, load, cog_init, refresh, sleep.
+// A panel session: epd_open (reset, frame data, register sequence, DC-DC up), any number of
+// epd_pull, epd_close. Same sequence as PDi EPD_Driver_GU_large and the stock epd.py, plus what the
+// badge team documented for this B1 CoG (2026-Billboard_Badge/documentation/itc97-driver-reference.pdf):
+// the 0x70 booster setting and the 0xB0 short waveform.
+
+// Short waveform for the B1 CoG: data/rendered_luts.py "lutb_base" from the badge team.
+// 5 tables (paper, ink, red, unused, VCOM) x 10 groups of {level, on, off, ph2, on, off, ph2, repeat};
+// a level byte is 2 bits per phase: 0 GND, 1 VDH, 2 VDL, 3 VDHR. A pull runs a fixed ~1070 ms
+// whatever the table asks for, so one pull is a light dose and three make a clean image.
+static const uint8_t lutb[400] = {
+    // table 0: paper
+    0x99, 0x0A, 0x0A, 0x01, 0x0A, 0x0A, 0x01, 0x03,
+    0xAA, 0x2D, 0x03, 0x01, 0x2D, 0x03, 0x01, 0x03,
+    0xAA, 0x2D, 0x03, 0x01, 0x2D, 0x03, 0x01, 0x03,
+    0xAA, 0x2D, 0x03, 0x01, 0x2D, 0x03, 0x01, 0x03,
+    0xAA, 0x2D, 0x03, 0x01, 0x2D, 0x03, 0x01, 0x03,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    // table 1: ink
+    0x66, 0x0A, 0x0A, 0x01, 0x0A, 0x0A, 0x01, 0x03,
+    0x44, 0x2D, 0x01, 0x01, 0x2D, 0x01, 0x01, 0x03,
+    0x44, 0x2D, 0x01, 0x01, 0x2D, 0x01, 0x01, 0x03,
+    0x44, 0x2D, 0x01, 0x01, 0x2D, 0x01, 0x01, 0x03,
+    0x44, 0x2D, 0x01, 0x01, 0x2D, 0x01, 0x01, 0x03,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    // table 2: red
+    0xEE, 0x0A, 0x0A, 0x01, 0x0A, 0x0A, 0x01, 0x03,
+    0xAA, 0x2D, 0x01, 0x01, 0x2D, 0x01, 0x01, 0x03,
+    0xFF, 0x2D, 0x01, 0x01, 0x2D, 0x01, 0x01, 0x03,
+    0xFF, 0x2D, 0x01, 0x01, 0x2D, 0x01, 0x01, 0x03,
+    0xFF, 0x2D, 0x01, 0x01, 0x2D, 0x01, 0x01, 0x03,
+    0xFF, 0x2D, 0x01, 0x01, 0x2D, 0x01, 0x01, 0x03,
+    0xFF, 0x2D, 0x01, 0x01, 0x2D, 0x01, 0x01, 0x03,
+    0xFF, 0x2D, 0x01, 0x01, 0x2D, 0x01, 0x01, 0x03,
+    0xFF, 0x2D, 0x01, 0x01, 0x2D, 0x01, 0x01, 0x03,
+    0xFF, 0x2D, 0x01, 0x01, 0x2D, 0x01, 0x01, 0x03,
+    // table 3: unused
+    0x00, 0x0A, 0x0A, 0x01, 0x0A, 0x0A, 0x01, 0x03,
+    0x00, 0x2D, 0x01, 0x01, 0x2D, 0x01, 0x01, 0x03,
+    0x00, 0x2D, 0x01, 0x01, 0x2D, 0x01, 0x01, 0x03,
+    0x00, 0x2D, 0x01, 0x01, 0x2D, 0x01, 0x01, 0x03,
+    0x00, 0x2D, 0x01, 0x01, 0x2D, 0x01, 0x01, 0x03,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    // table 4: VCOM
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+};
+
 static void epd_reset(void)
 {
     ms(200);
@@ -114,6 +181,7 @@ static void epd_reset(void)
     gpio_set_level(CS_L, 1);
     gpio_set_level(CS_R, 1);
     ms(5);
+    CMD(BOTH, 0x70, 0x71, 0x36); // B1 booster setting. Without it a refresh draws ~2 A (badge team errata 9)
 }
 
 // Frame into CoG RAM. red NULL = no red; with_red false leaves the red RAM as it is (saves 80 ms).
@@ -127,42 +195,7 @@ static void epd_load(const uint8_t *black, const uint8_t *red, bool with_red)
     }
 }
 
-// temp: CoG temperature input. 0x82 = 25 C (PDi). The waveform length follows it.
-static void epd_cog_init(int temp)
-{
-    CMD(BOTH, 0x05, 0x7D);
-    ms(200);
-    CMD(BOTH, 0x05, 0x00);
-    ms(10);
-    CMD(BOTH, 0xD8, 0x80); // MS_SYNC
-    CMD(BOTH, 0xD6, 0x00); // BVSS
-    CMD(BOTH, 0xA7, 0x10);
-    ms(100);
-    CMD(BOTH, 0xA7, 0x00);
-    ms(100);
-    CMD(BOTH, 0x03, 0x00, 0x11); // OSC
-    for (int cog = LEFT; cog <= RIGHT; cog++) {
-        CMD(cog, 0x44, 0x00);
-        CMD(cog, 0x45, 0x80);
-        CMD(cog, 0xA7, 0x10);
-        ms(100);
-        CMD(cog, 0xA7, 0x00);
-        ms(100);
-        CMD(cog, 0x44, 0x06);
-        CMD(cog, 0x45, temp);
-        CMD(cog, 0xA7, 0x10);
-        ms(100);
-        CMD(cog, 0xA7, 0x00);
-        ms(100);
-    }
-    CMD(BOTH, 0x60, 0x25); // TCON
-    CMD(LEFT, 0x61, 0x01); // STV_DIR, master only
-    CMD(BOTH, 0x02, 0x00); // VCOM
-}
-
-// DC-DC up, run the waveform, DC-DC down. hold_ms > 0 cuts the waveform off after hold_ms
-// (much faster, ghosting). Returns how long the refresh itself took.
-static int epd_refresh(int hold_ms)
+static void dcdc_on(void)
 {
     CMD(BOTH, 0x51, 0x50, 0x01); // DC-DC soft start
     for (int v = 1; v <= 4; v++) {
@@ -190,41 +223,79 @@ static int epd_refresh(int hold_ms)
         ms(2);
     }
     CMD(BOTH, 0x09, 0xFF);
+    ms(100);
+    wait_ready("dc-dc on", 10000); // never trigger into a booster that is still ramping
+}
+
+// fast: load the short waveform instead of the panel's own 33 s one (black/white only, red goes pale).
+static void epd_open(const uint8_t *black, const uint8_t *red, bool fast)
+{
+    epd_reset();
+    epd_load(black, red, true);
+    CMD(BOTH, 0x05, 0x7D);
+    ms(200);
+    CMD(BOTH, 0x05, 0x00);
     ms(10);
+    CMD(BOTH, 0xD8, 0x80); // MS_SYNC
+    CMD(BOTH, 0xD6, 0x00); // BVSS
+    CMD(BOTH, 0xA7, 0x10);
+    ms(100);
+    CMD(BOTH, 0xA7, 0x00);
+    ms(100);
+    CMD(BOTH, 0x03, 0x00, 0x11); // OSC
+    for (int cog = LEFT; cog <= RIGHT; cog++) {
+        CMD(cog, 0x44, 0x00);
+        CMD(cog, 0x45, 0x80);
+        CMD(cog, 0xA7, 0x10);
+        ms(100);
+        CMD(cog, 0xA7, 0x00);
+        ms(100);
+        CMD(cog, 0x44, 0x06);
+        CMD(cog, 0x45, fast ? 0x84 : 0x82); // temperature 0x50 + 2 * C: 26 C as the badge team uses, 25 C stock
+        CMD(cog, 0xA7, 0x10);
+        ms(100);
+        CMD(cog, 0xA7, 0x00);
+        ms(fast ? 500 : 100); // this strobe commits the OTP waveform; 0xB0 must come after it settles
+    }
+    CMD(BOTH, 0x60, 0x25); // TCON
+    CMD(LEFT, 0x61, 0x01); // STV_DIR, master only
+    CMD(BOTH, 0x02, 0x00); // VCOM
+    if (fast) cmd(BOTH, 0xB0, lutb, sizeof lutb); // one chance per session: rewriting it re-latches the slow one
+    dcdc_on();
+}
 
-    wait_ready("dc-dc on");
+// Run the latched waveform n times on what is in RAM. Returns ms spent.
+static int epd_pull(int n, int timeout_ms)
+{
     int64_t t0 = esp_timer_get_time();
-    CMD(BOTH, 0x15, 0x3C); // display refresh
-    ms(5);
-    if (hold_ms > 0) ms(hold_ms);
-    else wait_ready("refresh");
-    int t = (esp_timer_get_time() - t0) / 1000;
+    while (n--) {
+        CMD(BOTH, 0x15, 0x3C);
+        ms(5);
+        wait_ready("pull", timeout_ms);
+    }
+    return (esp_timer_get_time() - t0) / 1000;
+}
 
+static void epd_close(void)
+{
     CMD(BOTH, 0x09, 0x7F); // DC-DC soft shutdown
     CMD(BOTH, 0x05, 0x7D);
     CMD(BOTH, 0x09, 0x00);
     ms(200);
-    wait_ready("dc-dc off");
-    return t;
-}
-
-static void epd_sleep(void)
-{
+    wait_ready("dc-dc off", 2000);
     gpio_set_level(DC, 0);
     gpio_set_level(CS_L, 0);
     gpio_set_level(RST, 0);
     gpio_set_level(CS_L, 1);
 }
 
-// Full 3-colour global update.
+// Full 3-colour update on the panel's own waveform.
 static void epd_show(const uint8_t *img)
 {
     int64_t t0 = esp_timer_get_time();
-    epd_reset();
-    epd_load(img, img + PLANE, true);
-    epd_cog_init(0x82);
-    epd_refresh(0);
-    epd_sleep();
+    epd_open(img, img + PLANE, false);
+    epd_pull(1, 120000);
+    epd_close();
     ESP_LOGI(TAG, "update done in %d ms", (int)((esp_timer_get_time() - t0) / 1000));
 }
 
@@ -272,40 +343,35 @@ static void show(int i)
     xTaskNotify(epd_task, i, eSetValueWithOverwrite); // a request during a refresh runs right after it
 }
 
-// ---- Rickroll: mono frames, CoG set up once, then load + refresh per frame.
+// ---- Rickroll: mono frames in one short-waveform session: a frame is its plane data + pulls.
 extern const uint8_t frames_bin[] asm("_binary_frames_1fps_bin_start");
 extern const uint8_t frames_end[] asm("_binary_frames_1fps_bin_end");
-static int rick_temp = 0x82, rick_hold = 0, rick_frames = 99; // tuning knobs, serial "r <temp> <hold> <frames>"
-static volatile bool quit; // serial "q": stop the rickroll / snake
+#define RICK_PULLS 1 // per frame after the first: 1 = ~0.94 fps with ghosting, 2-3 = cleaner and slower
 
 static void rickroll(void)
 {
-    int n = MIN(rick_frames, (frames_end - frames_bin) / PLANE);
+    int n = (frames_end - frames_bin) / PLANE;
     int64_t t0 = esp_timer_get_time();
-    epd_reset();
-    quit = false;
-    for (int k = 0; k < n && !quit; k++) {
+    epd_open(frames_bin, NULL, true); // red RAM cleared once
+    epd_pull(3, 5000);                // first frame at full dose
+    char log[160];                    // frame times, logged once at the end
+    int len = snprintf(log, sizeof log, "%d", (int)((esp_timer_get_time() - t0) / 1000));
+    for (int k = 1; k < n; k++) {
         int64_t t = esp_timer_get_time();
-        epd_load(frames_bin + k * PLANE, NULL, k == 0); // red RAM cleared once
-        if (k == 0) {
-            epd_cog_init(rick_temp);
-        } else {
-            CMD(BOTH, 0x05, 0x00); // undo the discharge of the last DC-DC shutdown
-            ms(10);
-        }
-        int r = epd_refresh(rick_hold);
-        ESP_LOGI(TAG, "rick frame %d: refresh %d ms, frame %d ms", k, r, (int)((esp_timer_get_time() - t) / 1000));
+        epd_load(frames_bin + k * PLANE, NULL, false);
+        epd_pull(RICK_PULLS, 5000);
+        len += snprintf(log + len, sizeof log - MIN(len, sizeof log), " %d", (int)((esp_timer_get_time() - t) / 1000));
     }
-    epd_sleep();
-    ESP_LOGI(TAG, "rickroll: %d frames in %d ms (temp 0x%02x, hold %d ms)", n,
-             (int)((esp_timer_get_time() - t0) / 1000), rick_temp, rick_hold);
+    epd_close();
+    ESP_LOGI(TAG, "rickroll: %d frames in %d ms, %d pull(s)/frame, frame ms: %s", n,
+             (int)((esp_timer_get_time() - t0) / 1000), RICK_PULLS, log);
 }
 
-// ---- Snake: 48 px cells, black/white, CoG set up once, each move refreshes only the changed rows.
+// ---- Snake: 48 px cells, black/white, short-waveform session, a move is plane data + pulls.
 #define CELL 48
 #define GW (W / CELL) // 20 x 14 grid
 #define GH (H / CELL)
-static int snake_temp = 0x82, snake_hold = 0, snake_window = 1; // tuning knobs, serial "n <temp> <hold> <window>"
+#define SNAKE_PULLS 1
 static volatile bool in_snake;
 static volatile int key_dir = -1; // last direction key: 0 left, 1 up, 2 down, 3 right
 static uint8_t fb[PLANE];         // snake screen, black plane
@@ -335,24 +401,22 @@ static void snake(void)
     do food = esp_random() % N; while (occ[food]);
     fill_cell(food, 16, true);
     key_dir = -1;
-    quit = false;
     in_snake = true;
-    epd_reset();
-    epd_load(fb, NULL, true);
-    epd_cog_init(snake_temp);
-    epd_refresh(snake_hold);
+    epd_open(fb, NULL, true);
+    epd_pull(3, 5000);
+    char log[200]; // move times, logged once at the end
+    int len = 0;
     for (;;) {
         int64_t t0 = esp_timer_get_time();
         int d = key_dir;
         if (d >= 0 && d != 3 - dir) dir = d; // no U-turns: opposite of d is 3 - d
         int x = q[hd] % GW + (dir == 3) - (dir == 0), y = q[hd] / GW + (dir == 2) - (dir == 1);
-        if (x < 0 || x >= GW || y < 0 || y >= GH || quit) break;
-        int h = y * GW + x, r0 = MIN(y, q[hd] / GW), r1 = MAX(y, q[hd] / GW);
+        if (x < 0 || x >= GW || y < 0 || y >= GH) break;
+        int h = y * GW + x;
         bool eat = h == food;
         if (!eat) { // the tail moves away first, so following it is allowed
             occ[q[tl]] = false;
             fill_cell(q[tl], 0, false);
-            r0 = MIN(r0, q[tl] / GW), r1 = MAX(r1, q[tl] / GW);
             tl = (tl + 1) % N;
         }
         if (occ[h]) break;
@@ -364,20 +428,19 @@ static void snake(void)
             if ((hd - tl + N) % N == N - 1) break; // board full: you win
             do food = esp_random() % N; while (occ[food]);
             fill_cell(food, 16, true);
-            r0 = MIN(r0, food / GW), r1 = MAX(r1, food / GW);
         }
-        epd_load(fb, NULL, false);
-        if (snake_window) // DRFW rows: 4-line units, +2 dummy units, 1 unit margin
-            CMD(BOTH, 0x90, 0x00, 0x3B, MAX(0, 12 * r0 + 1), MIN(0xA9, 12 * r1 + 14));
-        CMD(BOTH, 0x05, 0x00);
-        ms(10);
-        int r = epd_refresh(snake_hold);
-        ESP_LOGI(TAG, "snake move %d (rows %d-%d): refresh %d ms, move %d ms", ++moves, r0, r1, r,
-                 (int)((esp_timer_get_time() - t0) / 1000));
+        if (++moves % 20 == 0) { // badge team: a fresh session every 20 short refreshes
+            epd_close();
+            epd_open(fb, NULL, true);
+        } else {
+            epd_load(fb, NULL, false);
+        }
+        epd_pull(SNAKE_PULLS, 5000);
+        len += snprintf(log + len, sizeof log - MIN(len, sizeof log), " %d", (int)((esp_timer_get_time() - t0) / 1000));
     }
     in_snake = false;
-    ESP_LOGI(TAG, "snake over: length %d after %d moves", (hd - tl + N) % N + 1, moves);
-    epd_sleep();
+    ESP_LOGI(TAG, "snake over: length %d after %d moves, move ms:%s", (hd - tl + N) % N + 1, moves, len ? log : "");
+    epd_close();
     ms(2000);
 }
 
@@ -419,39 +482,6 @@ static void epd_loop(void *arg)
         }
         ESP_LOGI(TAG, "showing image %d", (int)i);
         epd_show(image(i));
-    }
-}
-
-// Serial console, for tuning without Wi-Fi (no redraw after):
-// "s <image>", "r <temp> <hold_ms> <frames>" rickroll, "n <temp> <hold_ms> <window 0/1>" snake.
-static void console(void *arg)
-{
-    char line[48];
-    size_t n = 0;
-    for (;;) {
-        char c;
-        if (read(0, &c, 1) != 1) { // the USB-JTAG console without driver never blocks
-            ms(20);
-            continue;
-        }
-        if (c != '\n') {
-            if (n < sizeof line - 1) line[n++] = c;
-            continue;
-        }
-        line[n] = 0;
-        n = 0;
-        int a = 0, b = 0, d = 99;
-        sscanf(line + 1, "%i %i %i", &a, &b, &d);
-        if (line[0] == 's' && exists(a)) show(a);
-        if (line[0] == 'q') quit = true;
-        if (line[0] == 'r') {
-            rick_temp = a, rick_hold = b, rick_frames = d;
-            xTaskNotify(epd_task, RICK, eSetValueWithOverwrite);
-        }
-        if (line[0] == 'n') {
-            snake_temp = a, snake_hold = b, snake_window = d;
-            xTaskNotify(epd_task, SNAKE, eSetValueWithOverwrite);
-        }
     }
 }
 
@@ -526,6 +556,47 @@ static esp_err_t post_upload(httpd_req_t *r)
     return httpd_resp_sendstr(r, "ok");
 }
 
+// Captive portal, part 1: every DNS A query gets 192.168.4.1, so the phone's connectivity check lands here.
+static void dns_task(void *arg)
+{
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(53), .sin_addr.s_addr = htonl(INADDR_ANY)};
+    bind(s, (struct sockaddr *)&a, sizeof a);
+    static const uint8_t answer[] = {0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 168, 4, 1}; // name ptr, A, IN, TTL 60
+    for (;;) {
+        uint8_t b[512];
+        struct sockaddr_in from;
+        socklen_t fl = sizeof from;
+        int n = recvfrom(s, b, sizeof b - sizeof answer, 0, (struct sockaddr *)&from, &fl);
+        int p = 12; // skip the header, then the first question's name
+        while (p < n && b[p]) p += b[p] + 1;
+        p += 5; // name end, QTYPE, QCLASS
+        if (n < 12 || p > n) continue;
+        bool a_query = b[p - 4] == 0 && b[p - 3] == 1;
+        b[2] = 0x81, b[3] = 0x80;                     // response, no error
+        b[4] = 0, b[5] = 1, b[6] = 0, b[7] = a_query; // 1 question, 1 answer for A (others: none)
+        memset(b + 8, 0, 4);                          // drop authority/additional (EDNS)
+        if (a_query) memcpy(b + p, answer, sizeof answer), p += sizeof answer;
+        sendto(s, b, p, 0, (struct sockaddr *)&from, fl);
+    }
+}
+
+// Captive portal, part 2: anything unknown (generate_204, hotspot-detect.html, ...) goes to the page.
+// iOS wants a body, not only the redirect.
+static esp_err_t to_portal(httpd_req_t *r, httpd_err_code_t err)
+{
+    httpd_resp_set_status(r, "303 See Other");
+    httpd_resp_set_hdr(r, "Location", "http://192.168.4.1/");
+    return httpd_resp_sendstr(r, "badge config: http://192.168.4.1/");
+}
+
+static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (id == WIFI_EVENT_AP_STACONNECTED) ESP_LOGI(TAG, "station joined, free heap %u", (unsigned)esp_get_free_heap_size());
+    if (id == WIFI_EVENT_AP_STADISCONNECTED)
+        ESP_LOGI(TAG, "station left, reason %d", ((wifi_event_ap_stadisconnected_t *)data)->reason);
+}
+
 static void web_start(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -533,6 +604,7 @@ static void web_start(void)
     esp_netif_create_default_wifi_ap(); // 192.168.4.1, DHCP server on
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init));
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL);
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
     wifi_config_t c = {.ap = {.password = "supercon", .channel = 1, .max_connection = 4, .authmode = WIFI_AUTH_WPA2_PSK}};
@@ -540,6 +612,7 @@ static void web_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &c));
     ESP_ERROR_CHECK(esp_wifi_start());
+    xTaskCreate(dns_task, "dns", 3072, NULL, 4, NULL);
     ESP_LOGI(TAG, "SoftAP \"%s\", password \"supercon\", http://192.168.4.1/", c.ap.ssid);
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -557,6 +630,8 @@ static void web_start(void)
         {.uri = "/snake", .method = HTTP_POST, .handler = post_snake},
     };
     for (int i = 0; i < sizeof uris / sizeof *uris; i++) httpd_register_uri_handler(srv, &uris[i]);
+    httpd_register_err_handler(srv, HTTPD_404_NOT_FOUND, to_portal);
+    ESP_LOGI(TAG, "web up, free heap %u (min %u)", (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size());
 }
 
 void app_main(void)
@@ -582,7 +657,6 @@ void app_main(void)
     epd_init();
     xTaskCreate(epd_loop, "epd", 4096, NULL, 5, &epd_task);
     show(exists(c) ? c : 0); // e-paper keeps its image, but redraw so boot always ends in a known state
-    xTaskCreate(console, "console", 3072, NULL, 2, NULL);
     xTaskCreate(buttons, "buttons", 3072, NULL, 3, NULL);
     web_start();
 }

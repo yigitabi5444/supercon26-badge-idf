@@ -8,7 +8,9 @@ written in plain C on ESP-IDF instead of the stock MicroPython + LVGL build.
 - Wi-Fi SoftAP with a one-page web UI: pick an image, or upload your own. The browser converts and dithers it to
   black/white/red, so the badge only stores raw panel planes.
 - Buttons: Menu+/Menu- step through images; A+B together starts Snake.
-- Work in progress: Rickroll (15 s at ~1 fps) and Snake use a shortened, windowed refresh. Expect ghosting.
+- Rickroll (15 frames at 0.94 fps, 1.07 s per frame) and Snake (1.06 s per move) use the badge team's short
+  waveform (register 0xB0, black/white only). Expect ghosting and a whole-panel flash per frame.
+- Work in progress: partial, no-flash updates for Snake.
 
 ## Build and flash
 
@@ -35,7 +37,8 @@ Flashing erases the stock MicroPython firmware and its files. To keep them, back
 
 ## Use
 
-Join the Wi-Fi network `badge-XXXX` (password `supercon`) and open http://192.168.4.1/.
+Join the Wi-Fi network `badge-XXXX` (password `supercon`). Phones open the page by themselves (captive
+portal); otherwise go to http://192.168.4.1/.
 
 | Endpoint | |
 |---|---|
