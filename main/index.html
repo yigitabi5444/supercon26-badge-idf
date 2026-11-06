@@ -13,7 +13,7 @@ canvas{width:100%;border:3px solid #ddd;box-sizing:border-box}
 <p id="st">loading…</p>
 <div id="g"></div>
 <p><button onclick="fetch('/rick',{method:'POST'}).then(r=>st(r.ok?'Rickroll: 15 frames in about 21 s, then about 35 s to redraw the current image.':'Error'))">Rickroll</button>
-<button onclick="fetch('/snake',{method:'POST'}).then(r=>st(r.ok?'Snake: MENU - turns clockwise, MENU + counter-clockwise. One move per second.':'Error'))">Snake</button></p>
+<button onclick="fetch('/snake',{method:'POST'}).then(r=>st(r.ok?'Snake: MENU - turns clockwise, MENU + counter-clockwise; walls wrap around.':'Error'))">Snake</button></p>
 <h3>Upload</h3>
 <p><input type="file" id="f" accept="image/*"> <label><input type="checkbox" id="d" checked> dither</label></p>
 <p><canvas id="p" width="960" height="672"></canvas></p>

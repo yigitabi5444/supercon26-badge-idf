@@ -7,8 +7,9 @@ written in plain C on ESP-IDF instead of the stock MicroPython + LVGL build.
 - No app framework, no filesystem. Pins and panel constants are hardcoded in one file, `main/main.c`.
 - Wi-Fi SoftAP with a one-page web UI: pick an image, or upload your own. The browser converts and dithers it to
   black/white/red, so the badge only stores raw panel planes.
-- Snake is the default mode at boot. Two buttons steer, named as printed on the badge: MENU - turns clockwise,
-  MENU + counter-clockwise; between games either starts a new one. A / B step through the images.
+- Snake is the default mode and plays nonstop (walls wrap around, a new game 3 s after a crash). Two buttons steer,
+  named as printed on the badge: MENU - turns clockwise, MENU + counter-clockwise. A / B step through the images,
+  which ends Snake; MENU brings it back.
 - Rickroll (15 frames at 0.94 fps, 1.07 s per frame) and Snake (1.06 s per move) use the badge team's short
   waveform (register 0xB0, black/white only). Expect ghosting and a whole-panel flash per frame.
 - Work in progress: partial, no-flash updates for Snake.

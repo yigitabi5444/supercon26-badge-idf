@@ -42,8 +42,9 @@ Buttons (from the old `lib/button.py`, active low, internal pull-ups; the silksc
 | SW7 BUTTON_4 "User B" | B | 16 | next image |
 | Boot | BOOT | 0 | unused |
 
-Snake is the default mode: the badge boots into a game. After a crash the board stays on screen until a MENU
-button starts the next game. Picking an image on the web page shows it after the current game ends.
+Snake is the default mode and plays nonstop: the badge boots into a game, walls wrap around, and after the snake
+bites itself the crash stays up for 3 s before a new game starts. A / B, or picking an image or the rickroll on
+the web page, ends Snake; a MENU button brings it back.
 
 LED bar: 8x WS2812 on GPIO38 (`lib/led_bar.py`), unused here.
 

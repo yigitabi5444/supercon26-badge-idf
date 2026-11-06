@@ -385,67 +385,79 @@ static void fill_cell(int c, int inset, bool ink)
             else fb[y * (W / 8) + x / 8] &= ~(0x80 >> (x & 7));
 }
 
+// The default mode, forever: draw a fresh board and play at once (walls wrap around); after the snake bites
+// itself, show that for 3 s and start over. An image or rickroll request ends Snake and goes back to epd_loop.
 static void snake(void)
 {
     enum { N = GW * GH };
     static int q[N]; // ring buffer of body cells, q[tl] = tail .. q[hd] = head
     static bool occ[N];
-    int hd = 2, tl = 0, dir = 1, food, moves = 0; // dir clockwise from up: 0 up, 1 right, 2 down, 3 left
-    memset(fb, 0, sizeof fb);
-    memset(occ, 0, sizeof occ);
-    for (int k = 0; k <= hd; k++) {
-        q[k] = GH / 2 * GW + 4 + k;
-        occ[q[k]] = true;
-        fill_cell(q[k], 3, true);
-    }
-    do food = esp_random() % N; while (occ[food]);
-    fill_cell(food, 16, true);
-    key_turn = 0;
-    in_snake = true;
-    epd_open(fb, NULL, true);
-    epd_pull(3, 5000);
-    char log[200]; // move times, logged once at the end
-    int len = 0;
     for (;;) {
-        int64_t t0 = esp_timer_get_time();
-        dir = (dir + __atomic_exchange_n(&key_turn, 0, __ATOMIC_RELAXED) + 4) % 4;
-        int x = q[hd] % GW + (dir == 1) - (dir == 3), y = q[hd] / GW + (dir == 2) - (dir == 0);
-        if (x < 0 || x >= GW || y < 0 || y >= GH) break;
-        int h = y * GW + x;
-        bool eat = h == food;
-        if (!eat) { // the tail moves away first, so following it is allowed
-            occ[q[tl]] = false;
-            fill_cell(q[tl], 0, false);
-            tl = (tl + 1) % N;
+        int hd = 2, tl = 0, dir = 1, food, moves = 0; // dir clockwise from up: 0 up, 1 right, 2 down, 3 left
+        memset(fb, 0, sizeof fb);
+        memset(occ, 0, sizeof occ);
+        for (int k = 0; k <= hd; k++) {
+            q[k] = GH / 2 * GW + 4 + k;
+            occ[q[k]] = true;
+            fill_cell(q[k], 3, true);
         }
-        if (occ[h]) break;
-        hd = (hd + 1) % N;
-        q[hd] = h;
-        occ[h] = true;
-        fill_cell(h, 3, true);
-        if (eat) {
-            if ((hd - tl + N) % N == N - 1) break; // board full: you win
-            do food = esp_random() % N; while (occ[food]);
-            fill_cell(food, 16, true);
+        do food = esp_random() % N; while (occ[food]);
+        fill_cell(food, 16, true);
+        __atomic_store_n(&key_turn, 0, __ATOMIC_RELAXED);
+        in_snake = true;
+        epd_open(fb, NULL, true);
+        epd_pull(3, 5000);
+        char log[200]; // move times, logged once at the end
+        int len = 0;
+        uint32_t req = SNAKE;
+        for (;;) {
+            if (xTaskNotifyWait(0, 0, &req, 0) && req != SNAKE) break; // someone wants an image or the rickroll
+            req = SNAKE;
+            int64_t t0 = esp_timer_get_time();
+            dir = (dir + __atomic_exchange_n(&key_turn, 0, __ATOMIC_RELAXED) + 4) % 4;
+            int x = (q[hd] % GW + (dir == 1) - (dir == 3) + GW) % GW;
+            int y = (q[hd] / GW + (dir == 2) - (dir == 0) + GH) % GH;
+            int h = y * GW + x;
+            bool eat = h == food;
+            if (!eat) { // the tail moves away first, so following it is allowed
+                occ[q[tl]] = false;
+                fill_cell(q[tl], 0, false);
+                tl = (tl + 1) % N;
+            }
+            if (occ[h]) break;
+            hd = (hd + 1) % N;
+            q[hd] = h;
+            occ[h] = true;
+            fill_cell(h, 3, true);
+            if (eat) {
+                if ((hd - tl + N) % N == N - 1) break; // board full: you win
+                do food = esp_random() % N; while (occ[food]);
+                fill_cell(food, 16, true);
+            }
+            if (++moves % 20 == 0) { // badge team: a fresh session every 20 short refreshes
+                epd_close();
+                epd_open(fb, NULL, true);
+            } else {
+                epd_load(fb, NULL, false);
+            }
+            epd_pull(SNAKE_PULLS, 5000);
+            if (len < sizeof log - 8) len += snprintf(log + len, sizeof log - len, " %d", (int)((esp_timer_get_time() - t0) / 1000));
         }
-        if (++moves % 20 == 0) { // badge team: a fresh session every 20 short refreshes
-            epd_close();
-            epd_open(fb, NULL, true);
-        } else {
-            epd_load(fb, NULL, false);
+        in_snake = false;
+        ESP_LOGI(TAG, "snake over: length %d after %d moves, move ms:%s", (hd - tl + N) % N + 1, moves, len ? log : "");
+        epd_close();
+        if (req != SNAKE) {
+            xTaskNotify(epd_task, req, eSetValueWithOverwrite); // hand the request back to epd_loop
+            return;
         }
-        epd_pull(SNAKE_PULLS, 5000);
-        len += snprintf(log + len, sizeof log - MIN(len, sizeof log), " %d", (int)((esp_timer_get_time() - t0) / 1000));
+        ms(3000); // let the crash be seen
     }
-    in_snake = false;
-    ESP_LOGI(TAG, "snake over: length %d after %d moves, move ms:%s", (hd - tl + N) % N + 1, moves, len ? log : "");
-    epd_close();
-    ms(2000);
 }
 
 // Buttons, active low. Snake is the default mode and uses two buttons, named as printed on the badge
 // (the silkscreen swaps the stock code's Menu +/-): "MENU -" (GPIO15) turns clockwise, "MENU +" (GPIO40)
-// counter-clockwise; between games either one starts a new game. A / B step back / forward through the images.
+// counter-clockwise; when Snake is not running either one starts it. A / B step back / forward through the
+// images (which ends a running Snake).
 static void buttons(void *arg)
 {
     enum { A = 39, PLUS = 40, MINUS = 15, B = 16 }; // printed labels
@@ -459,7 +471,7 @@ static void buttons(void *arg)
         if (down & 0b0110) {
             if (in_snake) __atomic_store_n(&key_turn, down & 0b0100 ? 1 : -1, __ATOMIC_RELAXED);
             else xTaskNotify(epd_task, SNAKE, eSetValueWithOverwrite);
-        } else if (down & 0b1001 && !in_snake) {
+        } else if (down & 0b1001) { // also ends a running Snake
             int i = cur, total = ndef + NSLOT;
             do i = (i + (down & 0b1000 ? 1 : total - 1)) % total; while (!exists(i));
             show(i);
