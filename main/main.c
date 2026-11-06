@@ -373,7 +373,7 @@ static void rickroll(void)
 #define GH (H / CELL)
 #define SNAKE_PULLS 1
 static volatile bool in_snake;
-static volatile int key_dir = -1; // last direction key: 0 left, 1 up, 2 down, 3 right
+static int key_turn; // set by the buttons: +1 clockwise, -1 counter-clockwise; one turn per move
 static uint8_t fb[PLANE];         // snake screen, black plane
 
 static void fill_cell(int c, int inset, bool ink)
@@ -390,7 +390,7 @@ static void snake(void)
     enum { N = GW * GH };
     static int q[N]; // ring buffer of body cells, q[tl] = tail .. q[hd] = head
     static bool occ[N];
-    int hd = 2, tl = 0, dir = 3, food, moves = 0;
+    int hd = 2, tl = 0, dir = 1, food, moves = 0; // dir clockwise from up: 0 up, 1 right, 2 down, 3 left
     memset(fb, 0, sizeof fb);
     memset(occ, 0, sizeof occ);
     for (int k = 0; k <= hd; k++) {
@@ -400,7 +400,7 @@ static void snake(void)
     }
     do food = esp_random() % N; while (occ[food]);
     fill_cell(food, 16, true);
-    key_dir = -1;
+    key_turn = 0;
     in_snake = true;
     epd_open(fb, NULL, true);
     epd_pull(3, 5000);
@@ -408,9 +408,8 @@ static void snake(void)
     int len = 0;
     for (;;) {
         int64_t t0 = esp_timer_get_time();
-        int d = key_dir;
-        if (d >= 0 && d != 3 - dir) dir = d; // no U-turns: opposite of d is 3 - d
-        int x = q[hd] % GW + (dir == 3) - (dir == 0), y = q[hd] / GW + (dir == 2) - (dir == 1);
+        dir = (dir + __atomic_exchange_n(&key_turn, 0, __ATOMIC_RELAXED) + 4) % 4;
+        int x = q[hd] % GW + (dir == 1) - (dir == 3), y = q[hd] / GW + (dir == 2) - (dir == 0);
         if (x < 0 || x >= GW || y < 0 || y >= GH) break;
         int h = y * GW + x;
         bool eat = h == food;
@@ -444,26 +443,25 @@ static void snake(void)
     ms(2000);
 }
 
-// Buttons, active low. Normal mode: Menu+ / Menu- step through the images, A+B starts Snake.
-// Snake: BUTTON_1..4 (A, Menu-, Menu+, B) = left, up, down, right.
+// Buttons, active low. Snake is the default mode and uses two buttons, named as printed on the badge
+// (the silkscreen swaps the stock code's Menu +/-): "MENU -" (GPIO15) turns clockwise, "MENU +" (GPIO40)
+// counter-clockwise; between games either one starts a new game. A / B step back / forward through the images.
 static void buttons(void *arg)
 {
-    static const int pin[4] = {39, 40, 15, 16}; // A, Menu- (silkscreen says +), Menu+ (silkscreen says -), B
-    gpio_config(&(gpio_config_t){.pin_bit_mask = BIT64(39) | BIT64(40) | BIT64(15) | BIT64(16),
+    enum { A = 39, PLUS = 40, MINUS = 15, B = 16 }; // printed labels
+    gpio_config(&(gpio_config_t){.pin_bit_mask = BIT64(A) | BIT64(PLUS) | BIT64(MINUS) | BIT64(B),
                                  .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE});
     for (int was = 0;; ms(20)) {
-        int now = 0;
-        for (int k = 0; k < 4; k++) now |= !gpio_get_level(pin[k]) << k;
+        int now = (!gpio_get_level(A)) | (!gpio_get_level(PLUS)) << 1 | (!gpio_get_level(MINUS)) << 2 |
+                  (!gpio_get_level(B)) << 3;
         int down = now & ~was;
         was = now;
-        if (!down) continue;
-        if (in_snake) {
-            key_dir = __builtin_ctz(down);
-        } else if (now == 0b1001) {
-            xTaskNotify(epd_task, SNAKE, eSetValueWithOverwrite);
-        } else if (down & 0b0110) {
+        if (down & 0b0110) {
+            if (in_snake) __atomic_store_n(&key_turn, down & 0b0100 ? 1 : -1, __ATOMIC_RELAXED);
+            else xTaskNotify(epd_task, SNAKE, eSetValueWithOverwrite);
+        } else if (down & 0b1001 && !in_snake) {
             int i = cur, total = ndef + NSLOT;
-            do i = (i + (down & 0b0100 ? 1 : total - 1)) % total; while (!exists(i));
+            do i = (i + (down & 0b1000 ? 1 : total - 1)) % total; while (!exists(i));
             show(i);
         }
     }
@@ -520,7 +518,7 @@ static esp_err_t post_rick(httpd_req_t *r)
 
 static esp_err_t post_snake(httpd_req_t *r)
 {
-    xTaskNotify(epd_task, SNAKE | REDRAW, eSetValueWithOverwrite);
+    xTaskNotify(epd_task, SNAKE, eSetValueWithOverwrite);
     return httpd_resp_sendstr(r, "ok");
 }
 
@@ -656,7 +654,8 @@ void app_main(void)
 
     epd_init();
     xTaskCreate(epd_loop, "epd", 4096, NULL, 5, &epd_task);
-    show(exists(c) ? c : 0); // e-paper keeps its image, but redraw so boot always ends in a known state
+    cur = exists(c) ? c : 0;
+    xTaskNotify(epd_task, SNAKE, eSetValueWithOverwrite); // Snake is the default mode
     xTaskCreate(buttons, "buttons", 3072, NULL, 3, NULL);
     web_start();
 }

@@ -34,13 +34,16 @@ Badge-specific differences:
 | PWR_EN | 48 | defined in `epd.py` but never used |
 
 Buttons (from the old `lib/button.py`, active low, internal pull-ups; the silkscreen swaps Menu +/-):
-| Button | GPIO | Normal mode | Snake |
+| Button (stock code name) | Printed on the badge | GPIO | Use |
 |---|---|---|---|
-| SW4 BUTTON_1 "User A" | 39 | (A+B together: start Snake) | left |
-| SW5 BUTTON_2 "Menu -" | 40 | previous image | up |
-| SW6 BUTTON_3 "Menu +" | 15 | next image | down |
-| SW7 BUTTON_4 "User B" | 16 | (A+B together: start Snake) | right |
-| Boot | 0 | unused | unused |
+| SW4 BUTTON_1 "User A" | A | 39 | previous image |
+| SW5 BUTTON_2 "Menu -" | MENU + | 40 | Snake: turn counter-clockwise; between games: new game |
+| SW6 BUTTON_3 "Menu +" | MENU - | 15 | Snake: turn clockwise; between games: new game |
+| SW7 BUTTON_4 "User B" | B | 16 | next image |
+| Boot | BOOT | 0 | unused |
+
+Snake is the default mode: the badge boots into a game. After a crash the board stays on screen until a MENU
+button starts the next game. Picking an image on the web page shows it after the current game ends.
 
 LED bar: 8x WS2812 on GPIO38 (`lib/led_bar.py`), unused here.
 
