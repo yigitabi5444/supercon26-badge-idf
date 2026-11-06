@@ -1,4 +1,4 @@
-// Billboard badge (Hackaday Supercon 2026): 9.7" 3-colour e-paper + Wi-Fi SoftAP image picker.
+// Billboard badge (Hackaday Supercon 2026): two-badge Pong over ESP-NOW on the 9.7" e-paper.
 #include <stdlib.h>
 #include <string.h>
 #include <sys/param.h>
@@ -7,15 +7,13 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_event.h"
-#include "esp_http_server.h"
 #include "esp_log.h"
+#include "driver/rmt_tx.h"
 #include "esp_mac.h"
-#include "esp_netif.h"
-#include "esp_partition.h"
+#include "esp_now.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
-#include "lwip/sockets.h"
 #include "nvs_flash.h"
 
 static const char *TAG = "badge";
@@ -289,16 +287,6 @@ static void epd_close(void)
     gpio_set_level(CS_L, 1);
 }
 
-// Full 3-colour update on the panel's own waveform.
-static void epd_show(const uint8_t *img)
-{
-    int64_t t0 = esp_timer_get_time();
-    epd_open(img, img + PLANE, false);
-    epd_pull(1, 120000);
-    epd_close();
-    ESP_LOGI(TAG, "update done in %d ms", (int)((esp_timer_get_time() - t0) / 1000));
-}
-
 static void epd_init(void)
 {
     gpio_set_level(DC, 1);
@@ -315,347 +303,304 @@ static void epd_init(void)
     ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &dev, &spi));
 }
 
-// ---- Images: baked-in defaults (in the app), then NSLOT upload slots in the "images" partition.
-#define NSLOT 16
-#define SLOT 0x28000 // IMG rounded up to whole 4 KB flash sectors
+// ---- Pong between two badges. The game runs on a 10 x 7 grid of 96 px cells, one step per panel frame.
+// The badge with the lower MAC is the host: it owns the game and steps it; the guest shows the host's state and
+// sends its paddle. Both screens show their own player on the left. Pairing and heartbeat: link.h, NOTES.md.
+#include "link.h"
+#define CELL 96
+#define PW (W / CELL) // 10 x 7
+#define PH (H / CELL)
+#define PAD 2         // paddle height in cells
+#define WIN 4         // first to 4: the LED bar has 4 LEDs per player
+#define CHANNEL 1
+#define LED_GPIO 38
+#define LED_FLIP 0    // 1 if LED 0 turns out to be on the right as you look at the badge
+#define LED_ON 12     // WS2812 brightness, 0-255
 
-extern const uint8_t defaults_bin[] asm("_binary_defaults_bin_start");
-extern const uint8_t defaults_end[] asm("_binary_defaults_bin_end");
-extern const char index_html[] asm("_binary_index_html_start");
-extern const char index_end[] asm("_binary_index_html_end");
-
-static const esp_partition_t *part;
-static const uint8_t *slots; // the whole images partition, memory-mapped
-static nvs_handle_t nvs;
+static uint8_t fb[PLANE]; // black plane
 static TaskHandle_t epd_task;
-enum { RICK = 1 << 16, REDRAW = 1 << 17, SNAKE = 1 << 18 }; // epd_task requests besides image numbers
-static int ndef, cur;
-static uint32_t valid; // bit k: slot k holds a complete upload
+static link_t lk;
+static game_t g;     // host: the game; guest: the host's latest, but g.py[1] is its own paddle
+static uint8_t seen; // last tick the guest has shown (host: as the guest reported it)
+static bool host;
+static volatile bool in_pong, a_pressed;
+static portMUX_TYPE gmux = portMUX_INITIALIZER_UNLOCKED;
 
-static const uint8_t *image(int i) { return i < ndef ? defaults_bin + i * IMG : slots + (i - ndef) * SLOT; }
-static bool exists(int i) { return i >= 0 && (i < ndef || (i < ndef + NSLOT && (valid >> (i - ndef) & 1))); }
-
-static void show(int i)
+static void box(int x0, int y0, int w, int h)
 {
-    cur = i;
-    nvs_set_i32(nvs, "cur", i);
-    nvs_commit(nvs);
-    xTaskNotify(epd_task, i, eSetValueWithOverwrite); // a request during a refresh runs right after it
+    for (int y = y0; y < y0 + h; y++)
+        for (int x = x0; x < x0 + w; x++) fb[y * (W / 8) + x / 8] |= 0x80 >> (x & 7);
 }
 
-// ---- Rickroll: mono frames in one short-waveform session: a frame is its plane data + pulls.
-extern const uint8_t frames_bin[] asm("_binary_frames_1fps_bin_start");
-extern const uint8_t frames_end[] asm("_binary_frames_1fps_bin_end");
-#define RICK_PULLS 1 // per frame after the first: 1 = ~0.94 fps with ghosting, 2-3 = cleaner and slower
-
-static void rickroll(void)
+// mirror: the guest flips the court so its own paddle (player 1) is on the left.
+static void draw(const game_t *s, bool mirror)
 {
-    int n = (frames_end - frames_bin) / PLANE;
-    int64_t t0 = esp_timer_get_time();
-    epd_open(frames_bin, NULL, true); // red RAM cleared once
-    epd_pull(3, 5000);                // first frame at full dose
-    char log[160];                    // frame times, logged once at the end
-    int len = snprintf(log, sizeof log, "%d", (int)((esp_timer_get_time() - t0) / 1000));
-    for (int k = 1; k < n; k++) {
-        int64_t t = esp_timer_get_time();
-        epd_load(frames_bin + k * PLANE, NULL, false);
-        epd_pull(RICK_PULLS, 5000);
-        len += snprintf(log + len, sizeof log - MIN(len, sizeof log), " %d", (int)((esp_timer_get_time() - t) / 1000));
-    }
-    epd_close();
-    ESP_LOGI(TAG, "rickroll: %d frames in %d ms, %d pull(s)/frame, frame ms: %s", n,
-             (int)((esp_timer_get_time() - t0) / 1000), RICK_PULLS, log);
-}
-
-// ---- Snake: 48 px cells, black/white, short-waveform session, a move is plane data + pulls.
-#define CELL 48
-#define GW (W / CELL) // 20 x 14 grid
-#define GH (H / CELL)
-#define SNAKE_PULLS 1
-static volatile bool in_snake;
-static int key_turn; // set by the buttons: +1 clockwise, -1 counter-clockwise; one turn per move
-static uint8_t fb[PLANE];         // snake screen, black plane
-
-static void fill_cell(int c, int inset, bool ink)
-{
-    int x0 = c % GW * CELL + inset, y0 = c / GW * CELL + inset, n = CELL - 2 * inset;
-    for (int y = y0; y < y0 + n; y++)
-        for (int x = x0; x < x0 + n; x++)
-            if (ink) fb[y * (W / 8) + x / 8] |= 0x80 >> (x & 7);
-            else fb[y * (W / 8) + x / 8] &= ~(0x80 >> (x & 7));
-}
-
-static void snake(void)
-{
-    enum { N = GW * GH };
-    static int q[N]; // ring buffer of body cells, q[tl] = tail .. q[hd] = head
-    static bool occ[N];
-    int hd = 2, tl = 0, dir = 1, food, moves = 0; // dir clockwise from up: 0 up, 1 right, 2 down, 3 left
     memset(fb, 0, sizeof fb);
-    memset(occ, 0, sizeof occ);
-    for (int k = 0; k <= hd; k++) {
-        q[k] = GH / 2 * GW + 4 + k;
-        occ[q[k]] = true;
-        fill_cell(q[k], 3, true);
+    for (int y = 0; y < H; y += 48) box(W / 2 - 4, y + 12, 8, 24); // centre line
+    for (int p = 0; p < 2; p++) {
+        bool left = (p == 0) != mirror;
+        box((left ? 0 : PW - 1) * CELL + 32, s->py[p] * CELL + 8, 32, PAD * CELL - 16);
+        for (int k = 0; k < s->score[p]; k++) box(left ? W / 2 - 60 - 48 * k : W / 2 + 36 + 48 * k, 12, 24, 24);
     }
-    do food = esp_random() % N; while (occ[food]);
-    fill_cell(food, 16, true);
-    key_turn = 0;
-    in_snake = true;
-    epd_open(fb, NULL, true);
-    epd_pull(3, 5000);
-    char log[200]; // move times, logged once at the end
-    int len = 0;
-    for (;;) {
-        int64_t t0 = esp_timer_get_time();
-        dir = (dir + __atomic_exchange_n(&key_turn, 0, __ATOMIC_RELAXED) + 4) % 4;
-        int x = q[hd] % GW + (dir == 1) - (dir == 3), y = q[hd] / GW + (dir == 2) - (dir == 0);
-        if (x < 0 || x >= GW || y < 0 || y >= GH) break;
-        int h = y * GW + x;
-        bool eat = h == food;
-        if (!eat) { // the tail moves away first, so following it is allowed
-            occ[q[tl]] = false;
-            fill_cell(q[tl], 0, false);
-            tl = (tl + 1) % N;
+    if (!s->tick) return; // not served yet
+    box((mirror ? PW - 1 - s->bx : s->bx) * CELL + 12, s->by * CELL + 12, CELL - 24, CELL - 24);
+    if (s->bx == 0 || s->bx == PW - 1) return; // a point: no next position
+    int nx = s->bx + s->dx, ny = s->by + s->dy;
+    if (ny < 0 || ny >= PH) ny = s->by - s->dy;
+    int x = (mirror ? PW - 1 - nx : nx) * CELL + 18, y = ny * CELL + 18, n = CELL - 36; // where the ball goes next:
+    box(x, y, n, 6), box(x, y + n - 6, n, 6), box(x, y, 6, n), box(x + n - 6, y, 6, n); // an outline
+}
+
+static void serve(game_t *g, int dir)
+{
+    g->bx = dir > 0 ? PW / 2 - 1 : PW / 2;
+    g->by = esp_random() % PH;
+    g->dx = dir;
+    g->dy = esp_random() & 1 ? 1 : -1;
+}
+
+// Host only: one game step.
+static void pong_tick(game_t *g)
+{
+    if (!++g->tick) g->tick = 1; // 0 means "not started"
+    if (g->bx == 0 || g->bx == PW - 1) { // last step was a point: serve towards whoever lost it
+        if (g->score[0] == WIN || g->score[1] == WIN) g->score[0] = g->score[1] = 0;
+        serve(g, g->bx ? 1 : -1);
+        return;
+    }
+    int y = g->by + g->dy;
+    if (y < 0 || y >= PH) g->dy = -g->dy, y = g->by + g->dy; // wall
+    int x = g->bx + g->dx;
+    if (x == 0 || x == PW - 1) {
+        int p = x != 0;
+        if (y >= g->py[p] && y < g->py[p] + PAD) g->dx = -g->dx, x = g->bx + g->dx; // paddle: back again
+        else g->score[!p]++; // missed: the ball goes into the gutter
+    }
+    g->bx = x;
+    g->by = y;
+}
+
+// Lockstep at the panel's ~1 frame/s: the host steps only after the guest has shown the last step, so both
+// players see every step for a whole frame. A frame is plane data + 1 pull, a fresh session every 20 frames.
+static void pong(void)
+{
+    ESP_LOGI(TAG, "pong: %s", host ? "host, left paddle" : "guest, right paddle");
+    in_pong = true;
+    int frames = 0;
+    for (uint8_t drawn = 0; lk.state == L_PAIRED;) {
+        taskENTER_CRITICAL(&gmux);
+        bool go = host ? seen == g.tick : g.tick != drawn;
+        if (go && host) pong_tick(&g);
+        game_t s = g;
+        taskEXIT_CRITICAL(&gmux);
+        if (!go) {
+            ms(20);
+            continue;
         }
-        if (occ[h]) break;
-        hd = (hd + 1) % N;
-        q[hd] = h;
-        occ[h] = true;
-        fill_cell(h, 3, true);
-        if (eat) {
-            if ((hd - tl + N) % N == N - 1) break; // board full: you win
-            do food = esp_random() % N; while (occ[food]);
-            fill_cell(food, 16, true);
-        }
-        if (++moves % 20 == 0) { // badge team: a fresh session every 20 short refreshes
-            epd_close();
+        draw(&s, !host);
+        if (frames % 20 == 0) {
+            if (frames) epd_close();
             epd_open(fb, NULL, true);
+            epd_pull(frames ? 1 : 3, 5000);
         } else {
             epd_load(fb, NULL, false);
+            epd_pull(1, 5000);
         }
-        epd_pull(SNAKE_PULLS, 5000);
-        len += snprintf(log + len, sizeof log - MIN(len, sizeof log), " %d", (int)((esp_timer_get_time() - t0) / 1000));
+        frames++;
+        drawn = s.tick;
+        if (!host) seen = drawn;
     }
-    in_snake = false;
-    ESP_LOGI(TAG, "snake over: length %d after %d moves, move ms:%s", (hd - tl + N) % N + 1, moves, len ? log : "");
-    epd_close();
-    ms(2000);
+    if (frames) epd_close();
+    in_pong = false;
+    ESP_LOGI(TAG, "pong over after %d frames: peer gone", frames);
 }
 
-// Buttons, active low. Snake is the default mode and uses two buttons, named as printed on the badge
-// (the silkscreen swaps the stock code's Menu +/-): "MENU -" (GPIO15) turns clockwise, "MENU +" (GPIO40)
-// counter-clockwise; between games either one starts a new game. A / B step back / forward through the images.
-static void buttons(void *arg)
-{
-    enum { A = 39, PLUS = 40, MINUS = 15, B = 16 }; // printed labels
-    gpio_config(&(gpio_config_t){.pin_bit_mask = BIT64(A) | BIT64(PLUS) | BIT64(MINUS) | BIT64(B),
-                                 .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE});
-    for (int was = 0;; ms(20)) {
-        int now = (!gpio_get_level(A)) | (!gpio_get_level(PLUS)) << 1 | (!gpio_get_level(MINUS)) << 2 |
-                  (!gpio_get_level(B)) << 3;
-        int down = now & ~was;
-        was = now;
-        if (down & 0b0110) {
-            if (in_snake) __atomic_store_n(&key_turn, down & 0b0100 ? 1 : -1, __ATOMIC_RELAXED);
-            else xTaskNotify(epd_task, SNAKE, eSetValueWithOverwrite);
-        } else if (down & 0b1001 && !in_snake) {
-            int i = cur, total = ndef + NSLOT;
-            do i = (i + (down & 0b1000 ? 1 : total - 1)) % total; while (!exists(i));
-            show(i);
-        }
-    }
-}
-
+// Unpaired: an empty court; then wait for the link task to pair.
 static void epd_loop(void *arg)
 {
     for (;;) {
-        uint32_t i;
-        xTaskNotifyWait(0, 0, &i, portMAX_DELAY);
-        if (i & (RICK | SNAKE)) {
-            if (i & RICK) rickroll();
-            else snake();
-            if (!(i & REDRAW)) continue;
-            i = cur;
-        }
-        ESP_LOGI(TAG, "showing image %d", (int)i);
-        epd_show(image(i));
+        draw(&(game_t){.py = {2, 2}}, false);
+        epd_open(fb, NULL, true); // red RAM cleared once
+        epd_pull(3, 5000);
+        epd_close();
+        xTaskNotifyWait(0, 0, NULL, portMAX_DELAY);
+        pong();
     }
 }
 
-// ---- Web UI
-static int query(httpd_req_t *r, const char *key)
+// ---- LED bar: 8x WS2812, RMT at 10 MHz (0: 0.3 us high, 0.9 us low; 1: 0.9 us high, 0.3 us low).
+static rmt_channel_handle_t led_ch;
+static rmt_encoder_handle_t led_enc;
+
+static void led_init(void)
 {
-    char q[32], v[8];
-    if (httpd_req_get_url_query_str(r, q, sizeof q) != ESP_OK || httpd_query_key_value(q, key, v, sizeof v) != ESP_OK)
-        return -1;
-    return atoi(v);
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&(rmt_tx_channel_config_t){.gpio_num = LED_GPIO, .clk_src = RMT_CLK_SRC_DEFAULT,
+                                                                   .resolution_hz = 10000000, .mem_block_symbols = 64,
+                                                                   .trans_queue_depth = 1}, &led_ch));
+    ESP_ERROR_CHECK(rmt_new_bytes_encoder(&(rmt_bytes_encoder_config_t){.bit0 = {.level0 = 1, .duration0 = 3, .duration1 = 9},
+                                                                         .bit1 = {.level0 = 1, .duration0 = 9, .duration1 = 3},
+                                                                         .flags.msb_first = 1}, &led_enc));
+    ESP_ERROR_CHECK(rmt_enable(led_ch));
 }
 
-static esp_err_t get_page(httpd_req_t *r) { return httpd_resp_send(r, index_html, index_end - index_html); }
-
-static esp_err_t get_list(httpd_req_t *r)
+// LED 0 is the left end, as the court is seen on this badge.
+static void leds(const uint8_t rgb[8][3])
 {
-    char s[80];
-    snprintf(s, sizeof s, "{\"cur\":%d,\"ndef\":%d,\"nslot\":%d,\"valid\":%u}", cur, ndef, NSLOT, (unsigned)valid);
-    httpd_resp_set_type(r, "application/json");
-    return httpd_resp_sendstr(r, s);
-}
-
-static esp_err_t get_image(httpd_req_t *r)
-{
-    int i = query(r, "i");
-    if (!exists(i)) return httpd_resp_send_404(r);
-    httpd_resp_set_type(r, "application/octet-stream");
-    return httpd_resp_send(r, (const char *)image(i), IMG);
-}
-
-static esp_err_t post_rick(httpd_req_t *r)
-{
-    xTaskNotify(epd_task, RICK | REDRAW, eSetValueWithOverwrite);
-    return httpd_resp_sendstr(r, "ok");
-}
-
-static esp_err_t post_snake(httpd_req_t *r)
-{
-    xTaskNotify(epd_task, SNAKE, eSetValueWithOverwrite);
-    return httpd_resp_sendstr(r, "ok");
-}
-
-static esp_err_t post_show(httpd_req_t *r)
-{
-    int i = query(r, "i");
-    if (!exists(i)) return httpd_resp_send_404(r);
-    show(i);
-    return httpd_resp_sendstr(r, "ok");
-}
-
-// Body: one image (black plane, red plane), streamed straight into the slot.
-static esp_err_t post_upload(httpd_req_t *r)
-{
-    static uint8_t buf[4096];
-    int s = query(r, "s");
-    if (s < 0 || s >= NSLOT || r->content_len != IMG)
-        return httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "want ?s=<slot> and a 161280 byte body");
-    valid &= ~(1u << s); // a half-written slot must not count after a power cut
-    nvs_set_u32(nvs, "valid", valid);
-    nvs_commit(nvs);
-    ESP_ERROR_CHECK(esp_partition_erase_range(part, s * SLOT, SLOT));
-    for (size_t got = 0; got < IMG;) {
-        int n = httpd_req_recv(r, (char *)buf, MIN(sizeof buf, IMG - got));
-        if (n <= 0) return ESP_FAIL; // client gone or timed out: slot stays invalid
-        ESP_ERROR_CHECK(esp_partition_write(part, s * SLOT + got, buf, n));
-        got += n;
+    static uint8_t grb[24];
+    uint8_t out[24];
+    for (int i = 0; i < 8; i++) {
+        uint8_t *o = out + 3 * (LED_FLIP ? 7 - i : i);
+        o[0] = rgb[i][1], o[1] = rgb[i][0], o[2] = rgb[i][2];
     }
-    valid |= 1u << s;
-    nvs_set_u32(nvs, "valid", valid); // committed by show()
-    ESP_LOGI(TAG, "slot %d uploaded", s);
-    show(ndef + s);
-    return httpd_resp_sendstr(r, "ok");
+    if (!memcmp(out, grb, sizeof grb)) return;
+    memcpy(grb, out, sizeof grb);
+    rmt_transmit(led_ch, led_enc, grb, sizeof grb, &(rmt_transmit_config_t){0});
+    rmt_tx_wait_all_done(led_ch, 10);
 }
 
-// Captive portal, part 1: every DNS A query gets 192.168.4.1, so the phone's connectivity check lands here.
-static void dns_task(void *arg)
+// Free: off (red for 0.5 s after a failed pairing or a lost peer). Seeking: blue. Playing: my points green from
+// the left, the peer's red from the right, the ball's column white; all green / all red when someone has won.
+static void led_update(int64_t now, int64_t red_until)
 {
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(53), .sin_addr.s_addr = htonl(INADDR_ANY)};
-    bind(s, (struct sockaddr *)&a, sizeof a);
-    static const uint8_t answer[] = {0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 168, 4, 1}; // name ptr, A, IN, TTL 60
-    for (;;) {
-        uint8_t b[512];
-        struct sockaddr_in from;
-        socklen_t fl = sizeof from;
-        int n = recvfrom(s, b, sizeof b - sizeof answer, 0, (struct sockaddr *)&from, &fl);
-        int p = 12; // skip the header, then the first question's name
-        while (p < n && b[p]) p += b[p] + 1;
-        p += 5; // name end, QTYPE, QCLASS
-        if (n < 12 || p > n) continue;
-        bool a_query = b[p - 4] == 0 && b[p - 3] == 1;
-        b[2] = 0x81, b[3] = 0x80;                     // response, no error
-        b[4] = 0, b[5] = 1, b[6] = 0, b[7] = a_query; // 1 question, 1 answer for A (others: none)
-        memset(b + 8, 0, 4);                          // drop authority/additional (EDNS)
-        if (a_query) memcpy(b + p, answer, sizeof answer), p += sizeof answer;
-        sendto(s, b, p, 0, (struct sockaddr *)&from, fl);
+    uint8_t c[8][3] = {0};
+    int fill = now < red_until ? 0 : lk.state == L_SEEK ? 2 : -1;
+    if (lk.state == L_PAIRED) {
+        taskENTER_CRITICAL(&gmux);
+        game_t s = g;
+        taskEXIT_CRITICAL(&gmux);
+        int me = !host;
+        fill = s.score[me] == WIN ? 1 : s.score[!me] == WIN ? 0 : -1;
+        for (int k = 0; k < s.score[me]; k++) c[k][1] = LED_ON;
+        for (int k = 0; k < s.score[!me]; k++) c[7 - k][0] = LED_ON;
+        int col = host ? s.bx : PW - 1 - s.bx;
+        if (s.tick) memset(c[(col * 7 + 4) / 9], LED_ON, 3);
     }
+    if (fill >= 0)
+        for (int i = 0; i < 8; i++) memset(c[i], 0, 3), c[i][fill] = LED_ON;
+    leds(c);
 }
 
-// Captive portal, part 2: anything unknown (generate_204, hotspot-detect.html, ...) goes to the page.
-// iOS wants a body, not only the redirect.
-static esp_err_t to_portal(httpd_req_t *r, httpd_err_code_t err)
+// ---- Radio: ESP-NOW only (no AP), packets go through a queue to the link task.
+typedef struct { uint8_t src[6]; pkt_t p; } rx_t;
+static QueueHandle_t rxq;
+
+static void radio_rx(const esp_now_recv_info_t *info, const uint8_t *data, int len)
 {
-    httpd_resp_set_status(r, "303 See Other");
-    httpd_resp_set_hdr(r, "Location", "http://192.168.4.1/");
-    return httpd_resp_sendstr(r, "badge config: http://192.168.4.1/");
+    rx_t r;
+    if (len != sizeof r.p) return;
+    memcpy(r.src, info->src_addr, 6);
+    memcpy(&r.p, data, len);
+    xQueueSend(rxq, &r, 0);
 }
 
-static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
+static void radio_start(void)
 {
-    if (id == WIFI_EVENT_AP_STACONNECTED) ESP_LOGI(TAG, "station joined, free heap %u", (unsigned)esp_get_free_heap_size());
-    if (id == WIFI_EVENT_AP_STADISCONNECTED)
-        ESP_LOGI(TAG, "station left, reason %d", ((wifi_event_ap_stadisconnected_t *)data)->reason);
-}
-
-static void web_start(void)
-{
-    ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_ap(); // 192.168.4.1, DHCP server on
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init));
-    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL);
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
-    wifi_config_t c = {.ap = {.password = "supercon", .channel = 1, .max_connection = 4, .authmode = WIFI_AUTH_WPA2_PSK}};
-    c.ap.ssid_len = snprintf((char *)c.ap.ssid, sizeof c.ap.ssid, "badge-%02X%02X", mac[4], mac[5]);
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &c));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
-    xTaskCreate(dns_task, "dns", 3072, NULL, 4, NULL);
-    ESP_LOGI(TAG, "SoftAP \"%s\", password \"supercon\", http://192.168.4.1/", c.ap.ssid);
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE)); // modem sleep would drop packets
+    ESP_ERROR_CHECK(esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE));
+    ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(radio_rx));
+    esp_now_peer_info_t bc = {.ifidx = WIFI_IF_STA};
+    memcpy(bc.peer_addr, link_bcast, 6);
+    ESP_ERROR_CHECK(esp_now_add_peer(&bc));
+    esp_read_mac(lk.me, ESP_MAC_WIFI_STA);
+    ESP_LOGI(TAG, "ESP-NOW on channel %d, me " MACSTR, CHANNEL, MAC2STR(lk.me));
+}
 
-    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.stack_size = 6144;
-    cfg.lru_purge_enable = true;
-    httpd_handle_t srv;
-    ESP_ERROR_CHECK(httpd_start(&srv, &cfg));
-    const httpd_uri_t uris[] = {
-        {.uri = "/", .method = HTTP_GET, .handler = get_page},
-        {.uri = "/list", .method = HTTP_GET, .handler = get_list},
-        {.uri = "/img", .method = HTTP_GET, .handler = get_image},
-        {.uri = "/show", .method = HTTP_POST, .handler = post_show},
-        {.uri = "/upload", .method = HTTP_POST, .handler = post_upload},
-        {.uri = "/rick", .method = HTTP_POST, .handler = post_rick},
-        {.uri = "/snake", .method = HTTP_POST, .handler = post_snake},
-    };
-    for (int i = 0; i < sizeof uris / sizeof *uris; i++) httpd_register_uri_handler(srv, &uris[i]);
-    httpd_register_err_handler(srv, HTTPD_404_NOT_FOUND, to_portal);
-    ESP_LOGI(TAG, "web up, free heap %u (min %u)", (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size());
+// Runs link.h every 10 ms or per packet, sends, applies game packets, drives the LEDs.
+static void link_task(void *arg)
+{
+    int was = L_FREE;
+    int64_t next_tx = 0, red_until = 0;
+    for (;;) {
+        rx_t r;
+        bool got = xQueueReceive(rxq, &r, pdMS_TO_TICKS(10));
+        int64_t now = esp_timer_get_time() / 1000;
+        if (__atomic_exchange_n(&a_pressed, false, __ATOMIC_RELAXED)) link_press(&lk, now);
+        if (got) link_rx(&lk, r.src, &r.p, now);
+        link_tick(&lk, now);
+        if (lk.state != was) {
+            ESP_LOGI(TAG, "link %d -> %d, peer " MACSTR, was, lk.state, MAC2STR(lk.peer));
+            if (lk.state == L_PAIRED) {
+                esp_now_peer_info_t pi = {.ifidx = WIFI_IF_STA};
+                memcpy(pi.peer_addr, lk.peer, 6);
+                esp_now_add_peer(&pi);
+                taskENTER_CRITICAL(&gmux);
+                host = memcmp(lk.me, lk.peer, 6) < 0;
+                g = (game_t){.py = {2, 2}};
+                seen = 0;
+                taskEXIT_CRITICAL(&gmux);
+                xTaskNotifyGive(epd_task);
+            }
+            if (was == L_PAIRED) esp_now_del_peer(lk.peer);
+            if (lk.state == L_FREE) red_until = now + 500;
+            was = lk.state;
+        }
+        if (got && lk.state == L_PAIRED && r.p.type == P_GAME && !memcmp(r.src, lk.peer, 6)) {
+            taskENTER_CRITICAL(&gmux);
+            if (host) {
+                g.py[1] = MIN(r.p.g.py[1], PH - PAD);
+                seen = r.p.seen;
+            } else {
+                uint8_t mine = g.py[1];
+                g = r.p.g;
+                g.py[1] = mine;
+            }
+            taskEXIT_CRITICAL(&gmux);
+        }
+        pkt_t p;
+        const uint8_t *to = link_pkt(&lk, now, &p);
+        if (to && now >= next_tx) {
+            taskENTER_CRITICAL(&gmux);
+            p.g = g;
+            p.seen = seen;
+            taskEXIT_CRITICAL(&gmux);
+            esp_now_send(to, (const uint8_t *)&p, sizeof p);
+            next_tx = now + (lk.state == L_SEEK ? LINK_PAIR_MS : LINK_GAME_MS);
+        }
+        led_update(now, red_until);
+    }
+}
+
+// Buttons, active low, named as printed: A (GPIO39) pairs; in a game MENU + (GPIO40) moves the paddle up and
+// MENU - (GPIO15) down, one cell per press.
+static void buttons(void *arg)
+{
+    enum { A = 39, PLUS = 40, MINUS = 15 };
+    gpio_config(&(gpio_config_t){.pin_bit_mask = BIT64(A) | BIT64(PLUS) | BIT64(MINUS), .mode = GPIO_MODE_INPUT,
+                                 .pull_up_en = GPIO_PULLUP_ENABLE});
+    for (int was = 0;; ms(20)) {
+        int now = (!gpio_get_level(A)) | (!gpio_get_level(PLUS)) << 1 | (!gpio_get_level(MINUS)) << 2;
+        int down = now & ~was;
+        was = now;
+        if (down & 1) __atomic_store_n(&a_pressed, true, __ATOMIC_RELAXED);
+        if (down & 0b110 && in_pong) {
+            taskENTER_CRITICAL(&gmux);
+            uint8_t *y = &g.py[!host];
+            *y = down & 0b010 ? MAX(*y - 1, 0) : MIN(*y + 1, PH - PAD);
+            taskEXIT_CRITICAL(&gmux);
+        }
+    }
 }
 
 void app_main(void)
 {
-    esp_err_t err = nvs_flash_init();
+    esp_err_t err = nvs_flash_init(); // Wi-Fi keeps its calibration here
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
-    ESP_ERROR_CHECK(nvs_open("badge", NVS_READWRITE, &nvs));
-    nvs_get_u32(nvs, "valid", &valid);
-    int32_t c = 0;
-    nvs_get_i32(nvs, "cur", &c);
-
-    part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "images");
-    assert(part && part->size >= NSLOT * SLOT);
-    esp_partition_mmap_handle_t map;
-    ESP_ERROR_CHECK(esp_partition_mmap(part, 0, NSLOT * SLOT, ESP_PARTITION_MMAP_DATA, (const void **)&slots, &map));
-    ndef = (defaults_end - defaults_bin) / IMG;
-    ESP_LOGI(TAG, "%d built-in images, slots in use 0x%04x", ndef, (unsigned)valid);
-
     epd_init();
+    led_init();
+    rxq = xQueueCreate(16, sizeof(rx_t));
+    radio_start();
     xTaskCreate(epd_loop, "epd", 4096, NULL, 5, &epd_task);
-    cur = exists(c) ? c : 0;
-    xTaskNotify(epd_task, SNAKE, eSetValueWithOverwrite); // Snake is the default mode
     xTaskCreate(buttons, "buttons", 3072, NULL, 3, NULL);
-    web_start();
+    xTaskCreate(link_task, "link", 4096, NULL, 6, NULL);
 }

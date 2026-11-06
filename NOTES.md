@@ -36,16 +36,13 @@ Badge-specific differences:
 Buttons (from the old `lib/button.py`, active low, internal pull-ups; the silkscreen swaps Menu +/-):
 | Button (stock code name) | Printed on the badge | GPIO | Use |
 |---|---|---|---|
-| SW4 BUTTON_1 "User A" | A | 39 | previous image |
-| SW5 BUTTON_2 "Menu -" | MENU + | 40 | Snake: turn counter-clockwise; between games: new game |
-| SW6 BUTTON_3 "Menu +" | MENU - | 15 | Snake: turn clockwise; between games: new game |
-| SW7 BUTTON_4 "User B" | B | 16 | next image |
+| SW4 BUTTON_1 "User A" | A | 39 | pair (press on both badges together) |
+| SW5 BUTTON_2 "Menu -" | MENU + | 40 | Pong: paddle up |
+| SW6 BUTTON_3 "Menu +" | MENU - | 15 | Pong: paddle down |
+| SW7 BUTTON_4 "User B" | B | 16 | unused |
 | Boot | BOOT | 0 | unused |
 
-Snake is the default mode: the badge boots into a game. After a crash the board stays on screen until a MENU
-button starts the next game. Picking an image on the web page shows it after the current game ends.
-
-LED bar: 8x WS2812 on GPIO38 (`lib/led_bar.py`), unused here.
+LED bar: 8x WS2812 on GPIO38 (`lib/led_bar.py`), GRB, driven by RMT (`led_init`/`leds` in main.c).
 
 SPI mode 0, MSB first, 8 MHz (same as PDi). CS and DC are driven by hand, so one command can span several SPI transfers.
 
@@ -58,7 +55,6 @@ The code uses only APIs that are the same in v5.x.
 - FreeRTOS default tick is 100 Hz. `pdMS_TO_TICKS(2)` is then 0 and the 2 ms DC-DC soft start steps would not wait.
   `sdkconfig.defaults` sets 1000 Hz and `ms()` adds one tick.
 - MicroPython: a soft reset breaks LVGL (MemoryError in display_create). Use `mpremote reset`.
-- Gallery PNGs are 960x670 (2 rows short); `mkimages.py` centres them.
 - One S3 SPI transaction carries at most 32 KB (2^18 bits). The first build sent a 40320-byte half-plane in one
   transaction, `ESP_ERROR_CHECK` aborted and the badge boot-looped every second (the SoftAP showed up but nobody
   could join). `tx()` now sends 4 KB pieces.
@@ -70,44 +66,62 @@ The code uses only APIs that are the same in v5.x.
   0x1FC000-0x800000. The current partition table overwrites that region.
 - IDF v6 uses picolibc by default: logs use `%d` with casts, not `%lld`.
 
-## Firmware (this directory)
-- `main/main.c`: panel driver, image store, rickroll, Snake, buttons, SoftAP + captive portal + web server.
-  One file, pins and panel constants hardcoded.
-- `main/index.html`: the web UI, embedded in the binary. Converts in the browser (canvas, nearest colour or
-  Floyd-Steinberg to black/white/red) and uploads raw planes only.
-- `tools/mkimages.py`: host script, PNG -> `main/defaults.bin` (the baked-in images). Name lines are optional
-  and go on the nametag: `python3 tools/mkimages.py "First" "Last"`. Needs Pillow (system python3 has it).
-- `tools/check_pack.js`: `node tools/check_pack.js`, checks the browser packer against the plane format.
+## Firmware (this directory, branch `pong`)
+Pong only: no SoftAP, no web UI, no images, no Snake/rickroll (all on `master`).
+- `main/main.c`: panel driver, Pong, LED bar, ESP-NOW radio, buttons. One file, pins and panel constants hardcoded.
+- `main/link.h`: the pairing/heartbeat state machine, plain C so it also builds on a PC.
+- `tools/test_link.c`: simulation of 4 badges on one channel with 20% packet loss:
+  `cc -I main tools/test_link.c -o /tmp/test_link && /tmp/test_link`.
 
-### Image format
-Black plane then red plane, 960x672 each, MONO_HLSB (row-major, 120 bytes per row, MSB = leftmost pixel),
-1 = ink. 80640 bytes per plane, 161280 bytes per image. White = neither bit set.
-The driver splits each row into the left CoG half (bytes 0-59) and right half (60-119) and bit-reverses
-every byte on the way out (panel `"B1"`, `REVERSE_BITS` in main.c).
+### Plane format
+960x672, MONO_HLSB (row-major, 120 bytes per row, MSB = leftmost pixel), 1 = ink, 80640 bytes. The driver splits
+each row into the left CoG half (bytes 0-59) and right half (60-119) and bit-reverses every byte on the way out
+(panel `"B1"`, `REVERSE_BITS` in main.c).
 
 ### Flash layout (8 MB)
 | Partition | Offset | Size | |
 |---|---|---|---|
-| nvs | 0x9000 | 0x6000 | Wi-Fi calibration, `badge/cur` (image on screen), `badge/valid` (slot bitmask) |
-| factory | 0x10000 | 0x400000 | app + 7 baked-in images (1.1 MB) + 15 rickroll frames (1.2 MB) |
-| images | 0x410000 | 0x280000 | 16 upload slots x 0x28000 |
+| nvs | 0x9000 | 0x6000 | Wi-Fi calibration |
+| factory | 0x10000 | 0x400000 | app (~0.75 MB) |
 
-Image index: 0-6 = built-in (0 = nametag), 7-22 = slots 1-16. A slot only counts after its upload finished
-(bit set in NVS after the last byte is written), so leftover MicroPython filesystem data there is ignored.
-At boot the firmware redraws the image from NVS `cur` (first boot: the nametag).
+## Pong over ESP-NOW
+Wi-Fi in STA mode, not connected, power save off, fixed on channel 1. Every packet is one 24-byte `pkt_t`
+(`main/link.h`, packed, little-endian):
 
-### Web API (http://192.168.4.1/)
-- `GET /` the page; `GET /list` `{"cur","ndef","nslot","valid"}`; `GET /img?i=N` raw planes of image N
-- `POST /show?i=N` queue a refresh (returns at once; the panel takes ~30 s)
-- `POST /upload?s=K` body = 161280 raw bytes -> slot K (0-15), then shows it
-- `POST /rick`, `POST /snake`: start the rickroll / Snake; afterwards the current image is redrawn
-- Captive portal: a tiny DNS server answers every name with 192.168.4.1 and unknown URLs get a 303 to `/`,
-  so phones open the page by themselves. DHCP option 114 was tried and removed again (it is meant for an
-  HTTPS captive-portal API, not a page).
+| Bytes | Field | |
+|---|---|---|
+| 0-3 | magic | `"PONG"` |
+| 4 | type | 1 = PAIR (broadcast), 2 = GAME (unicast) |
+| 5-6 | age | PAIR: ms since the sender pressed A |
+| 7-12 | peer | PAIR: the sender's choice (zero while undecided); GAME: the sender's peer |
+| 13 | seen | guest: last game tick it has shown |
+| 14-23 | game | tick, ball x/y/dx/dy, paddle row [host, guest], score [host, guest] |
+
+States: FREE, SEEK, PAIRED. Times from `link.h`:
+- **FREE.** Nothing sent. PAIR packets heard are remembered with the sender's press time (`now - age`), so a
+  partner who pressed first still counts. LEDs off (red for 0.5 s after a failed pairing or a lost peer).
+- **A pressed -> SEEK** (ignored while PAIRED). Broadcast PAIR every 50 ms. LEDs blue.
+  600 ms after the press (500 ms window + air time) the choice is made: the badges heard whose press was within
+  500 ms of mine. Exactly one -> that is my choice, it goes into `peer`. None or two+ -> FREE, press again.
+  So two pairs pressing at the same moment do not cross-bind: everybody sees two or three candidates and gives
+  up. Pairs that press a second apart do not see each other.
+- **SEEK -> PAIRED** when a packet from my choice names me as its choice/peer (mutual). No answer 1.5 s after the
+  press -> FREE.
+- **PAIRED.** Unicast GAME every 100 ms; it is the heartbeat. A press does nothing. No packet from the peer for
+  1 s -> FREE (the panel goes back to the empty court). So rebooting one badge is the only way to unpair.
+
+Game: 10 x 7 grid of 96 px cells, paddles 2 cells, first to 4. The lower MAC is the host (left paddle) and the
+only one that steps the game; the guest copies the host's state and sends its own paddle row. Each badge draws its
+own paddle on the left (the guest mirrors the court). Lockstep: the host steps only when the guest reports
+(`seen`) that it has shown the last step, so each step is on both screens for a whole frame, about 1.2-1.3 s per
+step (a fresh panel session every 20 frames adds ~3 s). The screen shows the ball solid and its next cell as an
+outline, so you move the paddle onto the outline. LEDs: my points green from the left end, the peer's red from
+the right end, the ball's column white; all green/red for one step when someone reaches 4. If LED 0 turns out to
+be on the right, set `LED_FLIP` in main.c.
 
 ### Build and flash
 ```
-cd ~/Documents/hackaday26/idf_port
+cd ~/Documents/hackaday26/pong
 source ~/.espressif/tools/activate_idf_v6.0.2.sh
 idf.py build
 idf.py -p /dev/cu.usbmodem101 flash monitor
@@ -136,7 +150,6 @@ MicroPython never uses.
 - The doc's VCC_EN (panel supply switch) is not driven here: GPIO48 (`EPD_PWR_EN` in the stock `epd.py`) is
   left alone, as in the stock firmware. The doc warns that a wrong supply polarity or driving the bus while the
   panel is unpowered can break the panel.
-- No report that a smaller DRFW (0x90) window shortens a refresh; Snake has a switch to try it.
 
 ### Measured on this badge (current driver, 8 MHz SPI)
 | What | Time |
