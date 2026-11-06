@@ -14,20 +14,18 @@ written in plain C on ESP-IDF instead of the stock MicroPython + LVGL build.
 
 You need ESP-IDF 5.x or 6.x, Python 3 with Pillow and numpy, and ffmpeg (only for the video frames).
 
-The baked-in images and the video frames are **not in this repo**. The badge art belongs to Hackaday and the
-video frames to their owner. Generate them locally first:
+The source images (`images/`) and the rickroll frames (`main/frames_1fps.bin`) are in the repo.
+Before the first build, bake the images with your name on the nametag:
 
 ```sh
-# 1. Badge art: copy the PNGs from a badge that still runs the stock MicroPython firmware
-mkdir -p images
-mpremote cp :data/graphics/hello_i_am_blank.png images/
-for f in 001 006 015 026 032 037; do mpremote cp :data/gallery/$f.png images/; done
-python3 tools/mkimages.py "First" "Last"        # -> main/defaults.bin (name lines optional)
+python3 tools/mkimages.py "First" "Last"        # images/*.png -> main/defaults.bin
+```
 
-# 2. Video frames for the playback mode (any video; this writes main/frames_1fps.bin)
-python3 tools/mkframes.py some_video.mp4 1 0 15  # fps, start s, duration s, [ffmpeg precrop]
+To redo the video frames: `python3 tools/mkframes.py video.mp4 1 43 15 636:476:109:2` (fps, start s, duration s, precrop).
 
-# 3. Build and flash
+Build and flash:
+
+```sh
 idf.py build
 idf.py -p /dev/cu.usbmodem101 flash monitor
 ```

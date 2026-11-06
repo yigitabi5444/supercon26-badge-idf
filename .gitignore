@@ -2,8 +2,10 @@ build/
 sdkconfig
 sdkconfig.old
 managed_components/
-# Badge art, video frames and flash dumps are not ours to publish: generate them locally (see README)
-*.bin
+# flash dumps
+oldfs_*.bin
+backup*.bin
 *.gif
-images/
 BRIEF.md
+# has a personal name on the nametag: generate with tools/mkimages.py
+main/defaults.bin
