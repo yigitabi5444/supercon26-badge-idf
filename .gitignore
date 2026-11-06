@@ -1,0 +1,9 @@
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+# Badge art, video frames and flash dumps are not ours to publish: generate them locally (see README)
+*.bin
+*.gif
+images/
+BRIEF.md
