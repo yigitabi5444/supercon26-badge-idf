@@ -323,7 +323,7 @@ static link_t lk;
 static game_t g;     // host: the game; guest: the host's latest, but g.py[1] is its own paddle
 static uint8_t seen; // last tick the guest has shown (host: as the guest reported it)
 static bool host;
-static volatile bool in_pong, a_pressed;
+static volatile bool in_pong, pressed;
 static portMUX_TYPE gmux = portMUX_INITIALIZER_UNLOCKED;
 
 static void box(int x0, int y0, int w, int h)
@@ -332,14 +332,22 @@ static void box(int x0, int y0, int w, int h)
         for (int x = x0; x < x0 + w; x++) fb[y * (W / 8) + x / 8] |= 0x80 >> (x & 7);
 }
 
+static void outline(int x, int y, int w, int h, int t)
+{
+    box(x, y, w, t), box(x, y + h - t, w, t), box(x, y, t, h), box(x + w - t, y, t, h);
+}
+
 // mirror: the guest flips the court so its own paddle (player 1) is on the left.
 static void draw(const game_t *s, bool mirror)
 {
     memset(fb, 0, sizeof fb);
     for (int y = 0; y < H; y += 48) box(W / 2 - 4, y + 12, 8, 24); // centre line
+    if (s->tick) box(0, 0, 8, H); // your side: the left one, with a goal line
     for (int p = 0; p < 2; p++) {
         bool left = (p == 0) != mirror;
-        box((left ? 0 : PW - 1) * CELL + 32, s->py[p] * CELL + 8, 32, PAD * CELL - 16);
+        int x = (left ? 0 : PW - 1) * CELL + 32, y = s->py[p] * CELL + 8, h = PAD * CELL - 16;
+        if (left) box(x, y, 32, h); // yours solid, the other badge's hollow
+        else outline(x, y, 32, h, 8);
         for (int k = 0; k < s->score[p]; k++) box(left ? W / 2 - 60 - 48 * k : W / 2 + 36 + 48 * k, 12, 24, 24);
     }
     if (!s->tick) return; // not served yet
@@ -347,8 +355,7 @@ static void draw(const game_t *s, bool mirror)
     if (s->bx == 0 || s->bx == PW - 1) return; // a point: no next position
     int nx = s->bx + s->dx, ny = s->by + s->dy;
     if (ny < 0 || ny >= PH) ny = s->by - s->dy;
-    int x = (mirror ? PW - 1 - nx : nx) * CELL + 18, y = ny * CELL + 18, n = CELL - 36; // where the ball goes next:
-    box(x, y, n, 6), box(x, y + n - 6, n, 6), box(x, y, 6, n), box(x + n - 6, y, 6, n); // an outline
+    outline((mirror ? PW - 1 - nx : nx) * CELL + 18, ny * CELL + 18, CELL - 36, CELL - 36, 6); // where it goes next
 }
 
 static void serve(game_t *g, int dir)
@@ -521,7 +528,7 @@ static void link_task(void *arg)
         rx_t r;
         bool got = xQueueReceive(rxq, &r, pdMS_TO_TICKS(10));
         int64_t now = esp_timer_get_time() / 1000;
-        if (__atomic_exchange_n(&a_pressed, false, __ATOMIC_RELAXED)) link_press(&lk, now);
+        if (__atomic_exchange_n(&pressed, false, __ATOMIC_RELAXED)) link_press(&lk, now);
         if (got) link_rx(&lk, r.src, &r.p, now);
         link_tick(&lk, now);
         if (lk.state != was) {
@@ -567,22 +574,23 @@ static void link_task(void *arg)
     }
 }
 
-// Buttons, active low, named as printed: A (GPIO39) pairs; in a game MENU + (GPIO40) moves the paddle up and
-// MENU - (GPIO15) down, one cell per press.
+// Buttons, active low, named as printed. Layout: MENU + top left, MENU - top right, A bottom left, B bottom right.
+// Any button starts pairing (ignored once paired); in a game the left column moves your paddle: MENU + up, A down.
 static void buttons(void *arg)
 {
-    enum { A = 39, PLUS = 40, MINUS = 15 };
-    gpio_config(&(gpio_config_t){.pin_bit_mask = BIT64(A) | BIT64(PLUS) | BIT64(MINUS), .mode = GPIO_MODE_INPUT,
-                                 .pull_up_en = GPIO_PULLUP_ENABLE});
+    enum { PLUS = 40, A = 39, MINUS = 15, B = 16 };
+    gpio_config(&(gpio_config_t){.pin_bit_mask = BIT64(PLUS) | BIT64(A) | BIT64(MINUS) | BIT64(B),
+                                 .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE});
     for (int was = 0;; ms(20)) {
-        int now = (!gpio_get_level(A)) | (!gpio_get_level(PLUS)) << 1 | (!gpio_get_level(MINUS)) << 2;
+        int now = (!gpio_get_level(PLUS)) | (!gpio_get_level(A)) << 1 | (!gpio_get_level(MINUS)) << 2 |
+                  (!gpio_get_level(B)) << 3;
         int down = now & ~was;
         was = now;
-        if (down & 1) __atomic_store_n(&a_pressed, true, __ATOMIC_RELAXED);
-        if (down & 0b110 && in_pong) {
+        if (down) __atomic_store_n(&pressed, true, __ATOMIC_RELAXED);
+        if (down & 0b11 && in_pong) {
             taskENTER_CRITICAL(&gmux);
             uint8_t *y = &g.py[!host];
-            *y = down & 0b010 ? MAX(*y - 1, 0) : MIN(*y + 1, PH - PAD);
+            *y = down & 1 ? MAX(*y - 1, 0) : MIN(*y + 1, PH - PAD);
             taskEXIT_CRITICAL(&gmux);
         }
     }

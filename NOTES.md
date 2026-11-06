@@ -36,10 +36,10 @@ Badge-specific differences:
 Buttons (from the old `lib/button.py`, active low, internal pull-ups; the silkscreen swaps Menu +/-):
 | Button (stock code name) | Printed on the badge | GPIO | Use |
 |---|---|---|---|
-| SW4 BUTTON_1 "User A" | A | 39 | pair (press on both badges together) |
-| SW5 BUTTON_2 "Menu -" | MENU + | 40 | Pong: paddle up |
-| SW6 BUTTON_3 "Menu +" | MENU - | 15 | Pong: paddle down |
-| SW7 BUTTON_4 "User B" | B | 16 | unused |
+| SW4 BUTTON_1 "User A" | A (bottom left) | 39 | pair; Pong: paddle down |
+| SW5 BUTTON_2 "Menu -" | MENU + (top left) | 40 | pair; Pong: paddle up |
+| SW6 BUTTON_3 "Menu +" | MENU - (top right) | 15 | pair |
+| SW7 BUTTON_4 "User B" | B (bottom right) | 16 | pair |
 | Boot | BOOT | 0 | unused |
 
 LED bar: 8x WS2812 on GPIO38 (`lib/led_bar.py`), GRB, driven by RMT (`led_init`/`leds` in main.c).
@@ -100,7 +100,7 @@ Wi-Fi in STA mode, not connected, power save off, fixed on channel 1. Every pack
 States: FREE, SEEK, PAIRED. Times from `link.h`:
 - **FREE.** Nothing sent. PAIR packets heard are remembered with the sender's press time (`now - age`), so a
   partner who pressed first still counts. LEDs off (red for 0.5 s after a failed pairing or a lost peer).
-- **A pressed -> SEEK** (ignored while PAIRED). Broadcast PAIR every 50 ms. LEDs blue.
+- **Any button pressed -> SEEK** (ignored while PAIRED). Broadcast PAIR every 50 ms. LEDs blue.
   600 ms after the press (500 ms window + air time) the choice is made: the badges heard whose press was within
   500 ms of mine. Exactly one -> that is my choice, it goes into `peer`. None or two+ -> FREE, press again.
   So two pairs pressing at the same moment do not cross-bind: everybody sees two or three candidates and gives
@@ -112,7 +112,8 @@ States: FREE, SEEK, PAIRED. Times from `link.h`:
 
 Game: 10 x 7 grid of 96 px cells, paddles 2 cells, first to 4. The lower MAC is the host (left paddle) and the
 only one that steps the game; the guest copies the host's state and sends its own paddle row. Each badge draws its
-own paddle on the left (the guest mirrors the court). Lockstep: the host steps only when the guest reports
+own side on the left (the guest mirrors the court): own paddle solid plus a goal line on the left edge, the other
+badge's paddle hollow. MENU + / A (the left column of buttons) move it up / down. Lockstep: the host steps only when the guest reports
 (`seen`) that it has shown the last step, so each step is on both screens for a whole frame, about 1.2-1.3 s per
 step (a fresh panel session every 20 frames adds ~3 s). The screen shows the ball solid and its next cell as an
 outline, so you move the paddle onto the outline. LEDs: my points green from the left end, the peer's red from
